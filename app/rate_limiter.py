@@ -1,15 +1,13 @@
 import time
 
-_last_call = 0
-RATE_LIMIT_SECONDS = 1.5  # Adjust if needed
+class RateLimiter:
+    def __init__(self):
+        self.last_called = {}
 
-def rate_limit():
-    """
-    Simple rate limiter to avoid hitting API too quickly.
-    """
-    global _last_call
-    now = time.time()
-    elapsed = now - _last_call
-    if elapsed < RATE_LIMIT_SECONDS:
-        time.sleep(RATE_LIMIT_SECONDS - elapsed)
-    _last_call = time.time()
+    def is_allowed(self, user_id, cooldown=2):
+        now = time.time()
+        if user_id in self.last_called:
+            if now - self.last_called[user_id] < cooldown:
+                return False
+        self.last_called[user_id] = now
+        return True
