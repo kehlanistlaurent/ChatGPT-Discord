@@ -3,111 +3,200 @@ import discord
 import openai
 import asyncio
 import random
+import time
+import requests
 from dotenv import load_dotenv
 from memory import Memory
-from rate_limiter import RateLimiter
-from utils import clean_message, search_web, get_gif, add_reaction
+from rate_limiter import rate_limit
+from utils import clean_message
 
-# Load environment variables
 load_dotenv()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://redis:6379')  # Default fallback for Docker
-OWNER_ID = int(os.getenv('DISCORD_OWNER_ID'))
-OWNER_USERNAME = os.getenv('DISCORD_OWNER_USERNAME')
-BOT_PERSONA = os.getenv('BOT_PERSONA', '').replace('\\n', '\n')
-CUSTOM_STATUS = os.getenv('CUSTOM_STATUS', f"watching over {OWNER_USERNAME}")
+openai.api_key = os.getenv('OPENAI_API_KEY')
+REDIS_URL = os.getenv('REDIS_URL')
+OWNER_ID = int(os.getenv('OWNER_ID'))
+OWNER_USERNAME = os.getenv('OWNER_USERNAME')
+BOT_NAME = os.getenv('BOT_NAME', 'ChatGPT')
+BOT_PERSONA = os.getenv('BOT_PERSONA', f"You are {BOT_NAME}, a conversational AI.")
+OWNER_TONE = os.getenv('OWNER_TONE', 'natural')
+OTHERS_TONE = os.getenv('OTHERS_TONE', 'neutral')
+CUSTOM_STATUS = os.getenv('CUSTOM_STATUS', f"{BOT_NAME} active")
+ENABLE_REACTIONS = os.getenv('ENABLE_REACTIONS', 'true').lower() == 'true'
+ENABLE_GIPHY = os.getenv('ENABLE_GIPHY', 'true').lower() == 'true'
+GIPHY_API_KEY = os.getenv('GIPHY_API_KEY')
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+GOOGLE_CX = os.getenv('GOOGLE_CX')
+DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
+LOG_FULL_QA = os.getenv('LOG_FULL_QA', 'false').lower() == 'true'
 MEMORY_ENABLED = os.getenv('MEMORY_ENABLED', 'true').lower() == 'true'
 ESCALATION_ENABLED = os.getenv('ESCALATION_ENABLED', 'false').lower() == 'true'
-WEB_SEARCH_ENABLED = os.getenv('WEB_SEARCH_ENABLED', 'false').lower() == 'true'
-GIPHY_API_KEY = os.getenv('GIPHY_API_KEY')
+DUCKDUCKGO_API_URL = "https://api.duckduckgo.com/"
 
-# OpenAI setup
-openai.api_key = OPENAI_API_KEY
-SELECTED_MODEL = "gpt-4o"
+SPAM_THRESHOLD = 5
+GIF_CHANCE = 0.25  # 25% chance for GIF
+GIF_COOLDOWN = random.randint(3, 5)
+REACT_COOLDOWN = random.randint(3, 5)
+gif_cooldown_counter = 0
+react_cooldown_counter = 0
 
-# Discord client
 intents = discord.Intents.default()
-intents.messages = True
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# Initialize helpers
-memory = Memory(REDIS_URL) if MEMORY_ENABLED else None
-rate_limiter = RateLimiter()
-
-# Cooldowns
-gif_cooldown_counter = 0
-reaction_cooldown_counter = 0
-
-async def openai_chat(user_id, content, history, persona):
+# Memory initialization
+if MEMORY_ENABLED:
     try:
-        response = openai.ChatCompletion.create(
-            model=SELECTED_MODEL,
-            messages=[{"role": "system", "content": persona}] +
-                     [{"role": "user", "content": msg} for msg in history] +
-                     [{"role": "user", "content": content}],
-            temperature=0.7
-        )
-        return response['choices'][0]['message']['content']
+        memory = Memory(REDIS_URL)
+        if not memory.redis:
+            raise Exception("Redis connection failed")
     except Exception as e:
-        print(f"❌ OpenAI API Error: {e}")
-        return "…"
+        print(f"⚠️ Memory disabled due to Redis error: {e}")
+        MEMORY_ENABLED = False
+else:
+    memory = None
+    print("ℹ️ Memory is disabled (MEMORY_ENABLED=false)")
+
+SELECTED_MODEL = "gpt-3.5-turbo"
+
+async def detect_best_model():
+    global SELECTED_MODEL
+    try:
+        models = await openai.models.list()
+        available_models = [m.id for m in models.data]
+        if "gpt-4o" in available_models:
+            SELECTED_MODEL = "gpt-4o"
+        elif "gpt-4" in available_models:
+            SELECTED_MODEL = "gpt-4"
+        safe_log(f"💎 Selected model: {SELECTED_MODEL}")
+    except Exception as e:
+        safe_log(f"⚠️ Model detection failed: {e}", "error")
+
+async def openai_chat(user_id, username, message, user_history, user_profile, escalation_level):
+    rate_limit()
+    if user_id == OWNER_ID or username == OWNER_USERNAME:
+        system_prompt = f"{BOT_PERSONA} Speak to the owner ({username}) using this tone: {OWNER_TONE}. Full owner recognition and confident tone."
+    else:
+        escalation_note = ""
+        if ESCALATION_ENABLED:
+            if escalation_level == 1:
+                escalation_note = " Your tone is cool and detached."
+            elif escalation_level == 2:
+                escalation_note = " Your tone is cold and intimidating."
+            elif escalation_level >= 3:
+                escalation_note = " Your tone is sharp and ruthless."
+        subtle_friend_note = " Subtle recognition of known friend." if user_profile.get("friend", False) else ""
+        system_prompt = f"{BOT_PERSONA} Speak to other users using this tone: {OTHERS_TONE}.{escalation_note}{subtle_friend_note}"
+
+    msgs = [{"role": "system", "content": system_prompt}] + user_history + [{"role": "user", "content": message}]
+    try:
+        response = openai.chat.completions.create(
+            model=SELECTED_MODEL,
+            messages=msgs,
+            temperature=0.85
+        )
+        return response.choices[0].message.content
+    except openai.error.InvalidRequestError:
+        return "I couldn't process that."
+
+async def ensure_user_history(user_id, username):
+    if not MEMORY_ENABLED:
+        return [], {}
+    hist = await memory.get(str(user_id))
+    if not hist:
+        hist = {}
+    hist["username"] = username
+    history = hist.get("history", [])
+    profile = hist.get("profile", {})
+    await memory.save(str(user_id), "username", username)
+    return history, profile
 
 @client.event
 async def on_ready():
+    safe_log(f"{BOT_NAME} is live.")
+    await detect_best_model()
     await client.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name=CUSTOM_STATUS)
+        activity=discord.Game(name=CUSTOM_STATUS)
     )
-    print(f"✅ Bot is online as {client.user}")
 
 @client.event
 async def on_message(message):
-    global gif_cooldown_counter, reaction_cooldown_counter
+    global gif_cooldown_counter, react_cooldown_counter
 
-    if message.author.bot or client.user not in message.mentions:
-        return  # Only respond if tagged/mentioned
+    if message.author.bot:
+        return
+    if client.user not in message.mentions:
+        return  # Respond only if tagged
 
-    user_id = str(message.author.id)
-    username = message.author.name
-    content = clean_message(message.content, client.user.name)
+    user_id = message.author.id
+    username = str(message.author.display_name)
+    content = clean_message(message.content, str(client.user.id))
+    user_history, user_profile = await ensure_user_history(user_id, username) if MEMORY_ENABLED else ([], {})
+    profile = user_profile.copy() if user_profile else {}
+    escalation_level = profile.get("escalation_level", 0)
 
-    # Owner recognition
-    if message.author.id == OWNER_ID or message.author.name == OWNER_USERNAME:
-        persona = BOT_PERSONA
-        history = await memory.get(user_id) if MEMORY_ENABLED else []
-    else:
-        persona = BOT_PERSONA
-        history = await memory.get("others") if MEMORY_ENABLED else []
+    if ESCALATION_ENABLED:
+        msg_times = profile.get("msg_times", [])
+        current_time = int(time.time())
+        msg_times = [t for t in msg_times if current_time - t < 30] + [current_time]
+        profile["msg_times"] = msg_times
+        if len(msg_times) >= SPAM_THRESHOLD and escalation_level < 3:
+            escalation_level += 1
+            profile["escalation_level"] = escalation_level
+            safe_log(f"🚨 Escalation triggered for {username} (Spam)")
 
-    history = history + [f"{username}: {content}"]
-
-    reply = await openai_chat(user_id, content, history, persona)
+    response = await openai_chat(user_id, username, content, user_history, user_profile, escalation_level)
 
     if MEMORY_ENABLED:
-        key = user_id if message.author.id == OWNER_ID else "others"
-        await memory.save(key, "history", history + [f"Bot: {reply}"])
+        new_history = user_history + [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": response}
+        ]
+        await memory.save(str(user_id), "history", new_history)
 
-    # Web search fallback
-    if WEB_SEARCH_ENABLED and "search" in content.lower():
-        search_results = await search_web(content)
-        reply += f"\n🔎 {search_results}"
+    await message.reply(response, mention_author=True)
 
-    await message.reply(reply)
-
-    if reaction_cooldown_counter == 0:
-        await add_reaction(message)
-        reaction_cooldown_counter = random.randint(3, 5)
-    else:
-        reaction_cooldown_counter -= 1
-
-    if GIPHY_API_KEY and gif_cooldown_counter == 0:
-        gif_url = await get_gif(reply, GIPHY_API_KEY)
-        if gif_url:
-            await message.channel.send(gif_url)
-        gif_cooldown_counter = random.randint(3, 5)
-    else:
+    # GIF logic
+    if ENABLE_GIPHY and gif_cooldown_counter == 0 and random.random() < GIF_CHANCE:
+        try:
+            giphy_url = "https://api.giphy.com/v1/gifs/search"
+            params = {
+                "api_key": GIPHY_API_KEY,
+                "q": content,
+                "limit": 10,
+                "offset": 0,
+                "rating": "pg-13",
+                "lang": "en"
+            }
+            response_gif = requests.get(giphy_url, params=params, timeout=5)
+            if response_gif.status_code == 200:
+                data = response_gif.json()
+                if data["data"]:
+                    gif_choice = random.choice(data["data"])
+                    gif_url = gif_choice["images"]["original"]["url"]
+                    await message.channel.send(gif_url)
+                else:
+                    safe_log("⚠️ No GIFs found for query.")
+            else:
+                safe_log(f"⚠️ Giphy API error: {response_gif.status_code}")
+        except Exception as e:
+            safe_log(f"⚠️ Giphy request failed: {e}")
+        gif_cooldown_counter = GIF_COOLDOWN
+    elif gif_cooldown_counter > 0:
         gif_cooldown_counter -= 1
+
+    # Reaction logic
+    if ENABLE_REACTIONS and react_cooldown_counter == 0:
+        try:
+            await message.add_reaction("🔥")
+            react_cooldown_counter = REACT_COOLDOWN
+        except discord.HTTPException:
+            pass
+    elif react_cooldown_counter > 0:
+        react_cooldown_counter -= 1
+
+def safe_log(msg, level="info"):
+    if DEBUG_MODE or level == "error":
+        print(msg)
 
 client.run(TOKEN)
