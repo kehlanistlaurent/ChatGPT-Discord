@@ -1,11 +1,6 @@
-# Core dependencies
 discord.py>=2.4.0
 openai>=1.10.0
 redis>=4.5.0
 python-dotenv>=1.0.0
-requests>=2.28.0
 ratelimit>=2.2.1
-
-# Optional features
-google-api-python-client>=2.98.0  # Required for Google Custom Search API
-duckduckgo-search>=3.8.3          # Fallback for web search if Google API fails
+requests>=2.28.0
